@@ -6,17 +6,29 @@ import { Dropbox } from 'dropbox';
 import cors from 'cors';
 
 const app = express();
-app.use(cors()); // Libera o acesso para o Claude
+app.use(cors());
 app.use(express.json());
 
-// CONEXÃO DROPBOX
-const dbx = new Dropbox({ accessToken: process.env.DROPBOX_ACCESS_TOKEN });
-const VAULT_ROOT = '/Brain'; // Alinha direto com a pasta do seu Obsidian
+// 1. PÁGINA INICIAL PARA VOCÊ TESTAR NO NAVEGADOR
+app.get("/", (req, res) => {
+  res.send(`
+    <html>
+      <body style="font-family: sans-serif; padding: 2rem; background: #1e1e1e; color: #fff;">
+        <h2 style="color: #4ade80;">✅ Servidor MCP está ONLINE!</h2>
+        <p>O seu trem chegou à estação com sucesso. O sistema está aguardando o Claude se conectar na rota /sse.</p>
+      </body>
+    </html>
+  `);
+});
 
-// CONFIGURAÇÃO MCP
+// 2. CONEXÃO DROPBOX
+const dbx = new Dropbox({ accessToken: process.env.DROPBOX_ACCESS_TOKEN });
+const VAULT_ROOT = '/Brain';
+
+// 3. CONFIGURAÇÃO MCP
 const mcpServer = new Server({
-  name: "obsidian-dropbox-cloud",
-  version: "1.1.0"
+  name: "obsidian-dropbox",
+  version: "1.2.0"
 }, {
   capabilities: { tools: {} }
 });
@@ -49,6 +61,7 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
   ]
 }));
 
+// ... (Restante das ferramentas de leitura e escrita do Dropbox)
 mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const dbxPath = `${VAULT_ROOT}${args.path.startsWith('/') ? '' : '/'}${args.path}`;
@@ -69,34 +82,42 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Nota salva com sucesso em: ${args.path}` }] };
     }
   } catch (error) {
-    return {
-      isError: true,
-      content: [{ type: "text", text: `Erro: ${error.message}` }]
-    };
+    return { isError: true, content: [{ type: "text", text: `Erro: ${error.message}` }] };
   }
 });
 
-// GERENCIADOR DE SESSÕES MCP
+// 4. SISTEMA DE SESSÕES COM URL ABSOLUTA (A CHAVE DO PROBLEMA)
 const transports = new Map();
 
 app.get("/sse", async (req, res) => {
-  console.log("Iniciando Handshake SSE com o Claude...");
-  const transport = new SSEServerTransport("/messages", res);
+  console.log(">>> [SSE] O Claude iniciou o handshake de conexão!");
+  
+  // Captura o protocolo e o domínio exato que o Railway gerou
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers.host;
+  
+  // Cria a URL de retorno absoluta (Ex: https://seu-app.railway.app/messages)
+  const absoluteMessagesUrl = `${protocol}://${host}/messages`;
+  console.log(">>> [SSE] URL de retorno absoluta enviada para o Claude:", absoluteMessagesUrl);
+  
+  const transport = new SSEServerTransport(absoluteMessagesUrl, res);
   
   transports.set(transport.sessionId, transport);
   await mcpServer.connect(transport);
   
   req.on('close', () => {
-    console.log(`Conexão fechada: ${transport.sessionId}`);
+    console.log(`<<< [SSE] Conexão fechada (Sessão: ${transport.sessionId})`);
     transports.delete(transport.sessionId);
   });
 });
 
 app.post("/messages", async (req, res) => {
+  console.log(">>> [POST] Recebendo comando na rota /messages");
   const sessionId = req.query.sessionId;
   const transport = transports.get(sessionId);
   
   if (!transport) {
+    console.error("ERRO: Sessão não encontrada para o ID:", sessionId);
     return res.status(404).send("Session not found");
   }
   
@@ -105,5 +126,5 @@ app.post("/messages", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`🚀 Servidor rodando lindamente na porta ${PORT}`);
 });
