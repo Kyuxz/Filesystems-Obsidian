@@ -349,7 +349,8 @@ def get_file_versions(path: str, limit: int = 10) -> str:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     print(f"🟢  Dropbox MCP server running on port {port}")
     print(f"    Connector URL → http://0.0.0.0:{port}/mcp")
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
