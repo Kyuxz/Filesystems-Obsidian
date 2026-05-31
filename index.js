@@ -8,7 +8,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const crypto = require("crypto"); // ─── Importado para o fluxo do OAuth PKCE ───
+const crypto = require("crypto");
 const { Dropbox } = require("dropbox");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
@@ -30,30 +30,19 @@ if (!DROPBOX_ACCESS_TOKEN) {
   process.exit(1);
 }
 
-// Armazenamento em memória para os códigos temporários de handshake OAuth
 const oauthCodes = new Map();
 
 // ─── Dropbox Client ──────────────────────────────────────────────────────────
 
 const dbx = new Dropbox({ accessToken: DROPBOX_ACCESS_TOKEN });
 
-/**
- * Helper: normalize a note path to a Dropbox file path within /Brain.
- * Ensures .md extension and removes leading slashes to avoid double slashes.
- */
 function toDropboxPath(notePath) {
   let clean = notePath.trim();
-  // Remove leading slash if present
   if (clean.startsWith("/")) clean = clean.slice(1);
-  // Remove .md extension if present (we'll add it consistently)
   if (clean.endsWith(".md")) clean = clean.slice(0, -3);
-  // Reconstruct full path within Brain folder
   return `${BRAIN_FOLDER}/${clean}.md`;
 }
 
-/**
- * Helper: safely extract Dropbox API error message
- */
 function dropboxErrorMessage(err) {
   if (err?.error?.error_summary) return err.error.error_summary;
   if (err?.message) return err.message;
@@ -64,17 +53,13 @@ function dropboxErrorMessage(err) {
 
 const app = express();
 
-// Enable CORS for all origins (Claude web client requirement)
-app.use(cors({ origin: "*", credentials: true }));
+// CORREÇÃO CRÍTICA DO CORS: 
+// origin: true permite a conexão com credenciais sem usar o proibido "*"
+app.use(cors({ origin: true, credentials: true }));
 
-// Parse JSON body for POST /messages endpoint
 app.use(express.json({ limit: "10mb" }));
 
 // ─── WWW-Authenticate Strict Parser Fix ─────────────────────────────────────
-// Anthropic's MCP client requires absolute URLs in the WWW-Authenticate header.
-// Relative resource_metadata paths are silently rejected, causing infinite loops.
-// This middleware intercepts 401 responses and injects a properly formatted
-// WWW-Authenticate header with an absolute, dynamically-built metadata URL.
 
 function wwwAuthenticateFix(req, res, next) {
   const originalSetHeader = res.setHeader.bind(res);
@@ -84,7 +69,6 @@ function wwwAuthenticateFix(req, res, next) {
   res.setHeader = function (name, value) {
     if (name.toLowerCase() === "www-authenticate" && typeof value === "string") {
       if (value.includes('resource_metadata="') && !value.includes("://")) {
-        // Relative path detected — rewrite to absolute URL
         const proto = req.headers["x-forwarded-proto"] || "https";
         const host = req.headers.host || req.headers[":authority"] || "localhost";
         const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
@@ -94,7 +78,6 @@ function wwwAuthenticateFix(req, res, next) {
         );
         wwwAuthFixed = true;
       } else if (value.startsWith("Bearer") && !value.includes("resource_metadata")) {
-        // Missing resource_metadata entirely — inject it
         const proto = req.headers["x-forwarded-proto"] || "https";
         const host = req.headers.host || req.headers[":authority"] || "localhost";
         const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
@@ -167,7 +150,6 @@ app.get("/", (req, res) => {
 });
 
 // ─── OAuth Protected Resource Metadata ───────────────────────────────────────
-// Required by Anthropic MCP client for proper OAuth discovery
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   const proto = req.headers["x-forwarded-proto"] || "https";
@@ -180,46 +162,44 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// ─── OAuth 2.0 PKCE Handshake Route Handlers (VIP LOG MODE) ──────────────────
-// Auto-approves single-user credentials to bypass Claude UI requirements securely.
+// ─── OAuth 2.0 PKCE Handshake Route Handlers ─────────────────────────────────
 
 app.get("/authorize", (req, res) => {
   console.log(">>> [OAuth] O Claude iniciou o pedido de autorização GET /authorize");
-  console.log(">>> [OAuth] Parametros recebidos:", req.query);
   
   const { redirect_uri, state } = req.query;
-  const code = crypto.randomBytes(32).toString("hex");
 
+  // CORREÇÃO: Impede que pings de teste do Claude causem um redirecionamento para 'undefined'
+  if (!redirect_uri) {
+    console.log(">>> [OAuth] Ping de teste recebido (sem redirect_uri). Retornando 200 OK.");
+    return res.status(200).send("OAuth Authorize Endpoint - OK");
+  }
+
+  const code = crypto.randomBytes(32).toString("hex");
   const urlDeRetorno = `${redirect_uri}?code=${code}&state=${state}`;
   console.log(">>> [OAuth] Aprovando e redirecionando o Claude para:", urlDeRetorno);
   
   res.redirect(urlDeRetorno);
 });
 
-// Adicionamos express.json() aqui para garantir que lemos independente de como o Claude enviar
 app.post("/token", express.urlencoded({ extended: true }), express.json(), (req, res) => {
   console.log(">>> [OAuth] O Claude pediu o Token POST /token");
-  console.log(">>> [OAuth] Corpo da requisicao:", req.body);
 
-  // Criamos tokens falsos perfeitamente válidos
   const fakeAccessToken = crypto.randomBytes(32).toString("hex");
   const fakeRefreshToken = crypto.randomBytes(32).toString("hex");
 
   console.log(">>> [OAuth] Handshake concluído! Enviando token de acesso para o Claude.");
   
-  // Aprovamos incondicionalmente para evitar falhas de PKCE
   res.json({
     access_token: fakeAccessToken,
     token_type: "Bearer",
     expires_in: 86400,
-    refresh_token: fakeRefreshToken
+    refresh_token: fakeRefreshToken,
+    scope: "mcp"
   });
 });
 
 // ─── MCP Server Factory ──────────────────────────────────────────────────────
-// CRITICAL: Claude makes rapid, concurrent connection attempts.
-// A single global Server instance crashes with "Already connected to a transport".
-// We MUST create a fresh Server instance per SSE connection.
 
 function createMcpServer() {
   const server = new Server(
@@ -371,21 +351,14 @@ function createMcpServer() {
 }
 
 // ─── SSE Endpoint ────────────────────────────────────────────────────────────
-// CRITICAL FIX: Create a brand-new Server instance for every connection.
-// The Claude client fires multiple concurrent requests; sharing a global Server
-// causes: Error: Already connected to a transport.
 
-// Map to hold active transports keyed by session ID for message relay
 const activeTransports = new Map();
 
-// We wrap SSEServerTransport to register itself on creation
-// so the /messages endpoint can route to the correct transport.
 function TrackedSSEServerTransport(messagesUrl, res) {
   const transport = new SSEServerTransport(messagesUrl, res);
   const sessionId = transport.sessionId;
   activeTransports.set(sessionId, transport);
 
-  // Clean up on response close
   res.on("close", () => {
     activeTransports.delete(sessionId);
   });
@@ -403,9 +376,7 @@ app.get("/sse", async (req, res) => {
 
     console.log(`[SSE] Messages URL: ${messagesUrl}`);
 
-    // Use tracked transport so /messages can find it
     const transport = TrackedSSEServerTransport(messagesUrl, res);
-
     const mcpServer = createMcpServer();
 
     req.on("close", () => {
@@ -460,7 +431,6 @@ app.post("/messages", async (req, res) => {
 
 // ─── Error Handling ──────────────────────────────────────────────────────────
 
-// Catch-all error handler
 app.use((err, req, res, next) => {
   console.error("[Express] Unhandled error:", err);
   if (!res.headersSent) {
