@@ -8,6 +8,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto"); // ─── Importado para o fluxo do OAuth PKCE ───
 const { Dropbox } = require("dropbox");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
@@ -28,6 +29,9 @@ if (!DROPBOX_ACCESS_TOKEN) {
   console.error("[FATAL] DROPBOX_ACCESS_TOKEN environment variable is required");
   process.exit(1);
 }
+
+// Armazenamento em memória para os códigos temporários de handshake OAuth
+const oauthCodes = new Map();
 
 // ─── Dropbox Client ──────────────────────────────────────────────────────────
 
@@ -145,6 +149,8 @@ app.get("/", (req, res) => {
         <div class="endpoint"><span class="method">GET</span>  <span class="code">/sse</span> — SSE connection for MCP</div>
         <div class="endpoint"><span class="method">POST</span> <span class="code">/messages</span> — MCP message relay</div>
         <div class="endpoint"><span class="method">GET</span>  <span class="code">/.well-known/oauth-protected-resource</span> — OAuth metadata</div>
+        <div class="endpoint"><span class="method">GET</span>  <span class="code">/authorize</span> — OAuth authorization handler</div>
+        <div class="endpoint"><span class="method">POST</span> <span class="code">/token</span> — OAuth token exchange</div>
         
         <h3>Tools Exposed to Claude</h3>
         <ul>
@@ -171,6 +177,38 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
     authorization_servers: [`${proto}://${host}`],
     scopes_supported: ["mcp"],
     token_endpoint_auth_methods_supported: ["none"],
+  });
+});
+
+// ─── OAuth 2.0 PKCE Handshake Route Handlers ─────────────────────────────────
+// Auto-approves single-user credentials to bypass Claude UI requirements securely.
+
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+  const code = crypto.randomBytes(32).toString("hex");
+
+  oauthCodes.set(code, { code_challenge, code_challenge_method, redirect_uri });
+
+  // Redireciona imediatamente aprovando o acesso
+  res.redirect(`${redirect_uri}?code=${code}&state=${state}`);
+});
+
+app.post("/token", express.urlencoded({ extended: true }), (req, res) => {
+  const { code, code_verifier } = req.body;
+  const stored = oauthCodes.get(code);
+
+  if (!stored) return res.status(400).json({ error: "invalid_grant" });
+
+  // Validação estrita do desafio PKCE
+  const hash = crypto.createHash("sha256").update(code_verifier).digest("base64url");
+  if (hash !== stored.code_challenge) return res.status(400).json({ error: "invalid_grant" });
+
+  oauthCodes.delete(code);
+
+  res.json({
+    access_token: crypto.randomBytes(32).toString("hex"),
+    token_type: "Bearer",
+    expires_in: 86400,
   });
 });
 
