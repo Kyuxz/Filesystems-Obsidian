@@ -6,26 +6,14 @@ import { Dropbox } from 'dropbox';
 import cors from 'cors';
 
 const app = express();
-app.use(cors());
+app.use(cors()); // Libera o acesso para o Claude
 app.use(express.json());
 
-// 1. CAMADA DE SEGURANÇA (API KEY)
-const API_KEY = "obsidian2026"; // Esta é a sua chave secreta
-
-app.use((req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${API_KEY}`) {
-    console.warn("Bloqueado: Tentativa de acesso sem API Key válida.");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-});
-
-// 2. CONEXÃO DROPBOX
+// CONEXÃO DROPBOX
 const dbx = new Dropbox({ accessToken: process.env.DROPBOX_ACCESS_TOKEN });
-const VAULT_ROOT = '/Brain';
+const VAULT_ROOT = '/Brain'; // Alinha direto com a pasta do seu Obsidian
 
-// 3. CONFIGURAÇÃO MCP
+// CONFIGURAÇÃO MCP
 const mcpServer = new Server({
   name: "obsidian-dropbox-cloud",
   version: "1.1.0"
@@ -88,7 +76,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// 4. GERENCIADOR DE SESSÕES MCP
+// GERENCIADOR DE SESSÕES MCP
 const transports = new Map();
 
 app.get("/sse", async (req, res) => {
@@ -117,5 +105,5 @@ app.post("/messages", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor Enterprise rodando na porta ${PORT}`);
+  console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
