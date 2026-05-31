@@ -350,7 +350,26 @@ def get_file_versions(path: str, limit: int = 10) -> str:
 
 if __name__ == "__main__":
     import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import Response as StarResponse
+
+    class NoOAuthMiddleware(BaseHTTPMiddleware):
+        """Block OAuth discovery so Claude treats this as an auth-free server."""
+        async def dispatch(self, request, call_next):
+            if request.url.path in (
+                "/.well-known/oauth-authorization-server",
+                "/.well-known/openid-configuration",
+                "/authorize",
+                "/token",
+                "/register",
+            ):
+                return StarResponse(status_code=404)
+            return await call_next(request)
+
     port = int(os.environ.get("PORT", 8000))
     print(f"🟢  Dropbox MCP server running on port {port}")
     print(f"    Connector URL → http://0.0.0.0:{port}/mcp")
-    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
+
+    asgi_app = mcp.streamable_http_app()
+    asgi_app.add_middleware(NoOAuthMiddleware)
+    uvicorn.run(asgi_app, host="0.0.0.0", port=port)
