@@ -36,7 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 # ─── Server setup ─────────────────────────────────────────────────────────────
 
-mcp = FastMCP(name="dropbox", version="1.0.0")
+mcp = FastMCP(name="dropbox")
 
 
 # ─── Dropbox client ───────────────────────────────────────────────────────────
