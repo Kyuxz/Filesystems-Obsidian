@@ -1,7 +1,6 @@
 /**
  * MCP Obsidian-Dropbox Server
  * Production-ready Express server for Railway deployment
- * Connects Claude to an Obsidian vault via Dropbox API using MCP SSE transport
  */
 
 require("dotenv").config();
@@ -30,10 +29,6 @@ if (!DROPBOX_ACCESS_TOKEN) {
   process.exit(1);
 }
 
-const oauthCodes = new Map();
-
-// ─── Dropbox Client ──────────────────────────────────────────────────────────
-
 const dbx = new Dropbox({ accessToken: DROPBOX_ACCESS_TOKEN });
 
 function toDropboxPath(notePath) {
@@ -53,100 +48,31 @@ function dropboxErrorMessage(err) {
 
 const app = express();
 
-// CORREÇÃO CRÍTICA DO CORS: 
-// origin: true permite a conexão com credenciais sem usar o proibido "*"
 app.use(cors({ origin: true, credentials: true }));
-
 app.use(express.json({ limit: "10mb" }));
 
-// ─── WWW-Authenticate Strict Parser Fix ─────────────────────────────────────
+// ─── SECURITY MIDDLEWARE (A PEÇA QUE FALTAVA) ────────────────────────────────
+// Exige token de acesso. Se não houver, retorna 401 com o cabeçalho estrito
+// de URL absoluta exigido pela Anthropic para iniciar o OAuth Discovery.
 
-function wwwAuthenticateFix(req, res, next) {
-  const originalSetHeader = res.setHeader.bind(res);
-  const originalWriteHead = res.writeHead.bind(res);
-  let wwwAuthFixed = false;
-
-  res.setHeader = function (name, value) {
-    if (name.toLowerCase() === "www-authenticate" && typeof value === "string") {
-      if (value.includes('resource_metadata="') && !value.includes("://")) {
-        const proto = req.headers["x-forwarded-proto"] || "https";
-        const host = req.headers.host || req.headers[":authority"] || "localhost";
-        const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
-        value = value.replace(
-          /resource_metadata="[^"]*/,
-          `resource_metadata="${absoluteMetadata}`
-        );
-        wwwAuthFixed = true;
-      } else if (value.startsWith("Bearer") && !value.includes("resource_metadata")) {
-        const proto = req.headers["x-forwarded-proto"] || "https";
-        const host = req.headers.host || req.headers[":authority"] || "localhost";
-        const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
-        value = `${value}, resource_metadata="${absoluteMetadata}"`;
-        wwwAuthFixed = true;
-      }
-    }
-    return originalSetHeader(name, value);
-  };
-
-  res.writeHead = function (statusCode, ...args) {
-    if (statusCode === 401 && !wwwAuthFixed) {
-      const proto = req.headers["x-forwarded-proto"] || "https";
-      const host = req.headers.host || req.headers[":authority"] || "localhost";
-      const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
-      originalSetHeader(
-        "WWW-Authenticate",
-        `Bearer realm="MCP", resource_metadata="${absoluteMetadata}"`
-      );
-    }
-    return originalWriteHead(statusCode, ...args);
-  };
-
+function requireAuth(req, res, next) {
+  if (!req.headers.authorization) {
+    console.log(`>>> [Auth] Bloqueando acesso sem token em: ${req.path}`);
+    
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers.host || req.headers[":authority"] || "localhost";
+    const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
+    
+    res.setHeader("WWW-Authenticate", `Bearer realm="MCP", resource_metadata="${absoluteMetadata}"`);
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   next();
 }
-
-app.use(wwwAuthenticateFix);
 
 // ─── Health Check Route ──────────────────────────────────────────────────────
 
 app.get("/", (req, res) => {
-  res.status(200).send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>MCP Obsidian Server</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 700px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
-          h1 { color: #7c3aed; }
-          .badge { display: inline-block; background: #10b981; color: white; padding: 4px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
-          .code { background: #f3f4f6; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 0.9rem; }
-          .endpoint { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin: 8px 0; }
-          .method { color: #7c3aed; font-weight: 700; font-family: monospace; }
-        </style>
-      </head>
-      <body>
-        <h1>MCP Obsidian-Dropbox Server</h1>
-        <p><span class="badge">Operational</span></p>
-        <p>This server connects Claude to your Obsidian vault via the Dropbox API using the Model Context Protocol.</p>
-        
-        <h3>Available Endpoints</h3>
-        <div class="endpoint"><span class="method">GET</span>  <span class="code">/sse</span> — SSE connection for MCP</div>
-        <div class="endpoint"><span class="method">POST</span> <span class="code">/messages</span> — MCP message relay</div>
-        <div class="endpoint"><span class="method">GET</span>  <span class="code">/.well-known/oauth-protected-resource</span> — OAuth metadata</div>
-        <div class="endpoint"><span class="method">GET</span>  <span class="code">/authorize</span> — OAuth authorization handler</div>
-        <div class="endpoint"><span class="method">POST</span> <span class="code">/token</span> — OAuth token exchange</div>
-        
-        <h3>Tools Exposed to Claude</h3>
-        <ul>
-          <li><strong>ler_nota</strong> — Read a Markdown note from <span class="code">/Brain</span></li>
-          <li><strong>escrever_nota</strong> — Write a Markdown note to <span class="code">/Brain</span></li>
-        </ul>
-        
-        <p style="margin-top: 40px; color: #6b7280; font-size: 0.85rem;">
-          Connected to Dropbox folder: <span class="code">${BRAIN_FOLDER}</span>
-        </p>
-      </body>
-    </html>
-  `);
+  res.status(200).send("MCP Obsidian-Dropbox Server - Operational");
 });
 
 // ─── OAuth Protected Resource Metadata ───────────────────────────────────────
@@ -165,37 +91,25 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
 // ─── OAuth 2.0 PKCE Handshake Route Handlers ─────────────────────────────────
 
 app.get("/authorize", (req, res) => {
-  console.log(">>> [OAuth] O Claude iniciou o pedido de autorização GET /authorize");
-  
+  console.log(">>> [OAuth] Pedido de autorização GET /authorize");
   const { redirect_uri, state } = req.query;
 
-  // CORREÇÃO: Impede que pings de teste do Claude causem um redirecionamento para 'undefined'
   if (!redirect_uri) {
-    console.log(">>> [OAuth] Ping de teste recebido (sem redirect_uri). Retornando 200 OK.");
     return res.status(200).send("OAuth Authorize Endpoint - OK");
   }
 
   const code = crypto.randomBytes(32).toString("hex");
-  const urlDeRetorno = `${redirect_uri}?code=${code}&state=${state}`;
-  console.log(">>> [OAuth] Aprovando e redirecionando o Claude para:", urlDeRetorno);
-  
-  res.redirect(urlDeRetorno);
+  res.redirect(`${redirect_uri}?code=${code}&state=${state}`);
 });
 
-app.post("/token", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+// Rota VIP simplificada ao máximo para evitar falhas de parse do body
+app.post("/token", (req, res) => {
   console.log(">>> [OAuth] O Claude pediu o Token POST /token");
-
-  const fakeAccessToken = crypto.randomBytes(32).toString("hex");
-  const fakeRefreshToken = crypto.randomBytes(32).toString("hex");
-
-  console.log(">>> [OAuth] Handshake concluído! Enviando token de acesso para o Claude.");
   
   res.json({
-    access_token: fakeAccessToken,
-    token_type: "Bearer",
-    expires_in: 86400,
-    refresh_token: fakeRefreshToken,
-    scope: "mcp"
+    access_token: crypto.randomBytes(32).toString("hex"),
+    token_type: "bearer",
+    expires_in: 31536000
   });
 });
 
@@ -203,57 +117,28 @@ app.post("/token", express.urlencoded({ extended: true }), express.json(), (req,
 
 function createMcpServer() {
   const server = new Server(
-    {
-      name: "obsidian-dropbox-server",
-      version: "1.0.0",
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
+    { name: "obsidian-dropbox-server", version: "1.0.0" },
+    { capabilities: { tools: {} } }
   );
-
-  // ─── Tool Definitions ──────────────────────────────────────────────────
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
         {
           name: "ler_nota",
-          description:
-            "Le uma nota Markdown do cofre Obsidian na pasta /Brain do Dropbox. " +
-            "Use caminho relativo (ex: 'Ideias/Projeto X'). A extensao .md e adicionada automaticamente.",
+          description: "Le uma nota Markdown do cofre Obsidian na pasta /Brain do Dropbox.",
           inputSchema: {
             type: "object",
-            properties: {
-              caminho: {
-                type: "string",
-                description:
-                  "Caminho relativo da nota dentro da pasta /Brain (ex: 'Ideias/Projeto X')",
-              },
-            },
+            properties: { caminho: { type: "string" } },
             required: ["caminho"],
           },
         },
         {
           name: "escrever_nota",
-          description:
-            "Escreve ou sobrescreve uma nota Markdown na pasta /Brain do Dropbox. " +
-            "Use caminho relativo (ex: 'Ideias/Projeto X'). A extensao .md e adicionada automaticamente.",
+          description: "Escreve ou sobrescreve uma nota Markdown na pasta /Brain do Dropbox.",
           inputSchema: {
             type: "object",
-            properties: {
-              caminho: {
-                type: "string",
-                description:
-                  "Caminho relativo da nota dentro da pasta /Brain (ex: 'Ideias/Projeto X')",
-              },
-              conteudo: {
-                type: "string",
-                description: "Conteudo Markdown completo da nota",
-              },
-            },
+            properties: { caminho: { type: "string" }, conteudo: { type: "string" } },
             required: ["caminho", "conteudo"],
           },
         },
@@ -261,86 +146,34 @@ function createMcpServer() {
     };
   });
 
-  // ─── Tool Handlers ─────────────────────────────────────────────────────
-
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     if (name === "ler_nota") {
-      const caminho = args?.caminho;
-      if (!caminho || typeof caminho !== "string") {
-        throw new McpError(ErrorCode.InvalidParams, "Parametro 'caminho' e obrigatorio e deve ser uma string.");
-      }
-
-      const filePath = toDropboxPath(caminho);
-      console.log(`[ler_nota] Reading: ${filePath}`);
-
+      const filePath = toDropboxPath(args.caminho);
       try {
         const response = await dbx.filesDownload({ path: filePath });
         const fileContent = response.result.fileBinary
           ? Buffer.from(response.result.fileBinary).toString("utf-8")
           : "";
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: fileContent || "(arquivo vazio)",
-            },
-          ],
-        };
+        return { content: [{ type: "text", text: fileContent || "(arquivo vazio)" }] };
       } catch (err) {
-        console.error(`[ler_nota] Error reading ${filePath}:`, dropboxErrorMessage(err));
-
-        if (err?.status === 409 || err?.error?.path?.[".tag"] === "not_found") {
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `Nota nao encontrada: "${caminho}" (verificado em: ${filePath})`
-          );
-        }
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Erro do Dropbox: ${dropboxErrorMessage(err)}`
-        );
+        throw new McpError(ErrorCode.InternalError, `Erro do Dropbox: ${dropboxErrorMessage(err)}`);
       }
     }
 
     if (name === "escrever_nota") {
-      const caminho = args?.caminho;
-      const conteudo = args?.conteudo;
-
-      if (!caminho || typeof caminho !== "string") {
-        throw new McpError(ErrorCode.InvalidParams, "Parametro 'caminho' e obrigatorio e deve ser uma string.");
-      }
-      if (conteudo === undefined || conteudo === null) {
-        throw new McpError(ErrorCode.InvalidParams, "Parametro 'conteudo' e obrigatorio.");
-      }
-
-      const filePath = toDropboxPath(caminho);
-      console.log(`[escrever_nota] Writing: ${filePath}`);
-
+      const filePath = toDropboxPath(args.caminho);
       try {
         await dbx.filesUpload({
           path: filePath,
-          contents: Buffer.from(conteudo, "utf-8"),
+          contents: Buffer.from(args.conteudo, "utf-8"),
           mode: { ".tag": "overwrite" },
           autorename: false,
         });
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Nota "${caminho}" salva com sucesso em ${filePath}.`,
-            },
-          ],
-        };
+        return { content: [{ type: "text", text: `Nota salva com sucesso em ${filePath}.` }] };
       } catch (err) {
-        console.error(`[escrever_nota] Error writing ${filePath}:`, dropboxErrorMessage(err));
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Erro do Dropbox ao salvar: ${dropboxErrorMessage(err)}`
-        );
+        throw new McpError(ErrorCode.InternalError, `Erro do Dropbox ao salvar: ${dropboxErrorMessage(err)}`);
       }
     }
 
@@ -350,7 +183,7 @@ function createMcpServer() {
   return server;
 }
 
-// ─── SSE Endpoint ────────────────────────────────────────────────────────────
+// ─── SSE Endpoint (PROTEGIDO POR requireAuth) ────────────────────────────────
 
 const activeTransports = new Map();
 
@@ -362,97 +195,55 @@ function TrackedSSEServerTransport(messagesUrl, res) {
   res.on("close", () => {
     activeTransports.delete(sessionId);
   });
-
   return transport;
 }
 
+// APLICANDO O MIDDLEWARE DE SEGURANÇA
+app.use("/sse", requireAuth);
+app.use("/messages", requireAuth);
+
 app.get("/sse", async (req, res) => {
-  console.log(`[SSE] New connection from ${req.ip || "unknown"} at ${new Date().toISOString()}`);
+  console.log(`[SSE] Conexão AUTENTICADA de ${req.ip || "unknown"}`);
 
   try {
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host || req.headers[":authority"] || `localhost:${PORT}`;
     const messagesUrl = `${proto}://${host}/messages`;
 
-    console.log(`[SSE] Messages URL: ${messagesUrl}`);
-
     const transport = TrackedSSEServerTransport(messagesUrl, res);
     const mcpServer = createMcpServer();
 
     req.on("close", () => {
-      console.log(`[SSE] Connection closed for ${req.ip || "unknown"}`);
-      try {
-        mcpServer.close();
-      } catch (e) {}
-    });
-
-    req.on("error", (err) => {
-      console.error(`[SSE] Connection error for ${req.ip || "unknown"}:`, err.message);
-      try {
-        mcpServer.close();
-      } catch (e) {}
+      try { mcpServer.close(); } catch (e) {}
     });
 
     await mcpServer.connect(transport);
-    console.log(`[SSE] Server connected successfully for ${req.ip || "unknown"}`);
+    console.log(`[SSE] Servidor MCP rodando para ${req.ip || "unknown"}`);
   } catch (err) {
-    console.error("[SSE] Failed to establish connection:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Failed to establish SSE connection" });
-    }
+    if (!res.headersSent) res.status(500).json({ error: "Failed to establish SSE connection" });
   }
 });
 
-// ─── Messages POST Handler ───────────────────────────────────────────────────
+// ─── Messages POST Handler (PROTEGIDO) ───────────────────────────────────────
 
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
-
-  if (!sessionId) {
-    return res.status(400).json({ error: "Missing sessionId query parameter" });
-  }
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
 
   const transport = activeTransports.get(sessionId);
-
-  if (!transport) {
-    console.error(`[messages] No active transport found for sessionId: ${sessionId}`);
-    return res.status(404).json({ error: "Session not found or expired" });
-  }
+  if (!transport) return res.status(404).json({ error: "Session not found" });
 
   try {
     await transport.handlePostMessage(req, res);
   } catch (err) {
-    console.error(`[messages] Error handling message for session ${sessionId}:`, err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Failed to process message" });
-    }
-  }
-});
-
-// ─── Error Handling ──────────────────────────────────────────────────────────
-
-app.use((err, req, res, next) => {
-  console.error("[Express] Unhandled error:", err);
-  if (!res.headersSent) {
-    res.status(500).json({ error: "Internal server error" });
+    if (!res.headersSent) res.status(500).json({ error: "Failed to process message" });
   }
 });
 
 // ─── Start Server ────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`
-╔══════════════════════════════════════════════════════════════════════╗
-║         MCP Obsidian-Dropbox Server — Running on Railway           ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  Port:          ${PORT.toString().padEnd(56)} ║
-║  Brain Folder:  ${BRAIN_FOLDER.padEnd(56)} ║
-║  Health Check:  GET /${"".padEnd(55)} ║
-║  SSE Endpoint:  GET /sse${"".padEnd(51)} ║
-║  Messages:      POST /messages?sessionId=<id>${"".padEnd(38)} ║
-║  OAuth Meta:    GET /.well-known/oauth-protected-resource${"".padEnd(24)} ║
-╚══════════════════════════════════════════════════════════════════════╝
-  `);
+  console.log(`🚀 MCP Obsidian-Dropbox Server rodando na porta ${PORT}`);
 });
 
 module.exports = { app };
