@@ -7,8 +7,9 @@ import { Dropbox } from 'dropbox';
 const app = express();
 app.use(express.json());
 
+// Conexão com o Dropbox usando a variável de ambiente do Railway
 const dbx = new Dropbox({ accessToken: process.env.DROPBOX_ACCESS_TOKEN });
-const VAULT_ROOT = '/Brain'; // Alinha direto com a sua pasta no Dropbox
+const VAULT_ROOT = '/Brain'; // Alinha direto com a pasta do seu Obsidian
 
 // Inicializa o servidor MCP
 const mcpServer = new Server({
@@ -75,9 +76,10 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Cria as rotas para o Claude se conectar via Nuvem (SSE)
 let sseTransport;
-app.get("/sse", async (req, res) => {
+
+// CORREÇÃO AQUI: Escutando direto na raiz (/) para o Claude aceitar a URL limpa
+app.get("/", async (req, res) => {
   sseTransport = new SSEServerTransport("/messages", res);
   await mcpServer.connect(sseTransport);
 });
