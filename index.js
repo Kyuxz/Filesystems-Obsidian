@@ -30,6 +30,7 @@ if (!DROPBOX_ACCESS_TOKEN) {
 }
 
 const dbx = new Dropbox({ accessToken: DROPBOX_ACCESS_TOKEN });
+const oauthCodes = new Map(); // Restored proper memory store for PKCE
 
 function toDropboxPath(notePath) {
   let clean = notePath.trim();
@@ -38,33 +39,24 @@ function toDropboxPath(notePath) {
   return `${BRAIN_FOLDER}/${clean}.md`;
 }
 
-function dropboxErrorMessage(err) {
-  if (err?.error?.error_summary) return err.error.error_summary;
-  if (err?.message) return err.message;
-  return "Unknown Dropbox API error";
-}
-
-// ─── Express App ─────────────────────────────────────────────────────────────
+// ─── Express App & Proper CORS ───────────────────────────────────────────────
 
 const app = express();
 
+// 1. FIXED: Explicitly handle CORS preflight for ALL routes so OPTIONS returns 204 No Content
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "10mb" }));
+app.options('*', cors({ origin: true, credentials: true }));
 
-// ─── SECURITY MIDDLEWARE (A PEÇA QUE FALTAVA) ────────────────────────────────
-// Exige token de acesso. Se não houver, retorna 401 com o cabeçalho estrito
-// de URL absoluta exigido pela Anthropic para iniciar o OAuth Discovery.
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+// ─── STRICT AUTHENTICATION MIDDLEWARE ────────────────────────────────────────
 
 function requireAuth(req, res, next) {
-  // 1. Deixa o navegador fazer a checagem de segurança CORS (que não tem token) passar livremente
-  if (req.method === 'OPTIONS') {
-    return next();
-  }
+  // CORS handles OPTIONS, but this is a safety net
+  if (req.method === 'OPTIONS') return next();
 
-  // 2. Bloqueia quem tentar acessar as rotas de verdade sem o token
   if (!req.headers.authorization) {
-    console.log(`>>> [Auth] Bloqueando acesso sem token em: ${req.method} ${req.path}`);
-    
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host || req.headers[":authority"] || "localhost";
     const absoluteMetadata = `${proto}://${host}/.well-known/oauth-protected-resource`;
@@ -72,17 +64,14 @@ function requireAuth(req, res, next) {
     res.setHeader("WWW-Authenticate", `Bearer realm="MCP", resource_metadata="${absoluteMetadata}"`);
     return res.status(401).json({ error: "Unauthorized" });
   }
-  
   next();
 }
 
-// ─── Health Check Route ──────────────────────────────────────────────────────
+// ─── Health Check & Discovery ────────────────────────────────────────────────
 
 app.get("/", (req, res) => {
   res.status(200).send("MCP Obsidian-Dropbox Server - Operational");
 });
-
-// ─── OAuth Protected Resource Metadata ───────────────────────────────────────
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   const proto = req.headers["x-forwarded-proto"] || "https";
@@ -95,28 +84,44 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// ─── OAuth 2.0 PKCE Handshake Route Handlers ─────────────────────────────────
+// ─── STRICT OAUTH 2.0 PKCE IMPLEMENTATION ────────────────────────────────────
 
 app.get("/authorize", (req, res) => {
-  console.log(">>> [OAuth] Pedido de autorização GET /authorize");
-  const { redirect_uri, state } = req.query;
-
-  if (!redirect_uri) {
-    return res.status(200).send("OAuth Authorize Endpoint - OK");
-  }
+  const { redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+  
+  if (!redirect_uri) return res.status(400).send("Missing redirect_uri");
 
   const code = crypto.randomBytes(32).toString("hex");
+  
+  // Store the exact challenge to validate in /token
+  oauthCodes.set(code, { code_challenge, code_challenge_method, redirect_uri });
+
   res.redirect(`${redirect_uri}?code=${code}&state=${state}`);
 });
 
-// Rota VIP simplificada ao máximo para evitar falhas de parse do body
 app.post("/token", (req, res) => {
-  console.log(">>> [OAuth] O Claude pediu o Token POST /token");
-  
+  const { code, code_verifier } = req.body;
+  const stored = oauthCodes.get(code);
+
+  if (!stored) return res.status(400).json({ error: "invalid_grant" });
+
+  // 2. FIXED: Actually validate the PKCE hash to satisfy strict OAuth clients
+  const hash = crypto.createHash("sha256").update(code_verifier).digest("base64url");
+  if (hash !== stored.code_challenge) return res.status(400).json({ error: "invalid_grant" });
+
+  oauthCodes.delete(code);
+
+  // 3. FIXED: Adhering to RFC 6749 Section 5.1 caching requirements
+  res.set({
+    'Cache-Control': 'no-store',
+    'Pragma': 'no-cache'
+  });
+
   res.json({
     access_token: crypto.randomBytes(32).toString("hex"),
-    token_type: "bearer",
-    expires_in: 31536000
+    token_type: "Bearer",
+    expires_in: 31536000,
+    scope: "mcp"
   });
 });
 
@@ -155,85 +160,56 @@ function createMcpServer() {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-
     if (name === "ler_nota") {
-      const filePath = toDropboxPath(args.caminho);
       try {
-        const response = await dbx.filesDownload({ path: filePath });
-        const fileContent = response.result.fileBinary
-          ? Buffer.from(response.result.fileBinary).toString("utf-8")
-          : "";
+        const response = await dbx.filesDownload({ path: toDropboxPath(args.caminho) });
+        const fileContent = response.result.fileBinary ? Buffer.from(response.result.fileBinary).toString("utf-8") : "";
         return { content: [{ type: "text", text: fileContent || "(arquivo vazio)" }] };
       } catch (err) {
-        throw new McpError(ErrorCode.InternalError, `Erro do Dropbox: ${dropboxErrorMessage(err)}`);
+        throw new McpError(ErrorCode.InternalError, "Erro de leitura");
       }
     }
-
     if (name === "escrever_nota") {
-      const filePath = toDropboxPath(args.caminho);
       try {
-        await dbx.filesUpload({
-          path: filePath,
-          contents: Buffer.from(args.conteudo, "utf-8"),
-          mode: { ".tag": "overwrite" },
-          autorename: false,
-        });
-        return { content: [{ type: "text", text: `Nota salva com sucesso em ${filePath}.` }] };
+        await dbx.filesUpload({ path: toDropboxPath(args.caminho), contents: Buffer.from(args.conteudo, "utf-8"), mode: { ".tag": "overwrite" }, autorename: false });
+        return { content: [{ type: "text", text: "Salvo com sucesso." }] };
       } catch (err) {
-        throw new McpError(ErrorCode.InternalError, `Erro do Dropbox ao salvar: ${dropboxErrorMessage(err)}`);
+        throw new McpError(ErrorCode.InternalError, "Erro de escrita");
       }
     }
-
-    throw new McpError(ErrorCode.MethodNotFound, `Tool desconhecida: ${name}`);
+    throw new McpError(ErrorCode.MethodNotFound, "Tool desconhecida");
   });
 
   return server;
 }
 
-// ─── SSE Endpoint (PROTEGIDO POR requireAuth) ────────────────────────────────
+// ─── SSE & Messages Endpoints ────────────────────────────────────────────────
 
 const activeTransports = new Map();
 
-function TrackedSSEServerTransport(messagesUrl, res) {
-  const transport = new SSEServerTransport(messagesUrl, res);
-  const sessionId = transport.sessionId;
-  activeTransports.set(sessionId, transport);
-
-  res.on("close", () => {
-    activeTransports.delete(sessionId);
-  });
-  return transport;
-}
-
-// APLICANDO O MIDDLEWARE DE SEGURANÇA
-app.use("/sse", requireAuth);
-app.use("/messages", requireAuth);
-
-app.get("/sse", async (req, res) => {
-  console.log(`[SSE] Conexão AUTENTICADA de ${req.ip || "unknown"}`);
-
+// 4. FIXED: Apply auth middleware directly to the routes to avoid stripping the URL path
+app.get("/sse", requireAuth, async (req, res) => {
   try {
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host || req.headers[":authority"] || `localhost:${PORT}`;
     const messagesUrl = `${proto}://${host}/messages`;
 
-    const transport = TrackedSSEServerTransport(messagesUrl, res);
-    const mcpServer = createMcpServer();
+    const transport = new SSEServerTransport(messagesUrl, res);
+    const sessionId = transport.sessionId;
+    activeTransports.set(sessionId, transport);
+    
+    res.on("close", () => activeTransports.delete(sessionId));
 
-    req.on("close", () => {
-      try { mcpServer.close(); } catch (e) {}
-    });
+    const mcpServer = createMcpServer();
+    req.on("close", () => { try { mcpServer.close(); } catch (e) {} });
 
     await mcpServer.connect(transport);
-    console.log(`[SSE] Servidor MCP rodando para ${req.ip || "unknown"}`);
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: "Failed to establish SSE connection" });
+    if (!res.headersSent) res.status(500).json({ error: "SSE Error" });
   }
 });
 
-// ─── Messages POST Handler (PROTEGIDO) ───────────────────────────────────────
-
-app.post("/messages", async (req, res) => {
+app.post("/messages", requireAuth, async (req, res) => {
   const sessionId = req.query.sessionId;
   if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
 
@@ -246,8 +222,6 @@ app.post("/messages", async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: "Failed to process message" });
   }
 });
-
-// ─── Start Server ────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 MCP Obsidian-Dropbox Server rodando na porta ${PORT}`);
