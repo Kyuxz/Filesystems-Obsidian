@@ -56,8 +56,14 @@ app.use(express.json({ limit: "10mb" }));
 // de URL absoluta exigido pela Anthropic para iniciar o OAuth Discovery.
 
 function requireAuth(req, res, next) {
+  // 1. Deixa o navegador fazer a checagem de segurança CORS (que não tem token) passar livremente
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+
+  // 2. Bloqueia quem tentar acessar as rotas de verdade sem o token
   if (!req.headers.authorization) {
-    console.log(`>>> [Auth] Bloqueando acesso sem token em: ${req.path}`);
+    console.log(`>>> [Auth] Bloqueando acesso sem token em: ${req.method} ${req.path}`);
     
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host || req.headers[":authority"] || "localhost";
@@ -66,6 +72,7 @@ function requireAuth(req, res, next) {
     res.setHeader("WWW-Authenticate", `Bearer realm="MCP", resource_metadata="${absoluteMetadata}"`);
     return res.status(401).json({ error: "Unauthorized" });
   }
+  
   next();
 }
 
