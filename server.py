@@ -36,7 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 # ─── Server setup ─────────────────────────────────────────────────────────────
 
-mcp = FastMCP(name="dropbox")
+mcp = FastMCP(name="dropbox", host="0.0.0.0")
 
 
 # ─── Dropbox client ───────────────────────────────────────────────────────────
@@ -293,7 +293,13 @@ def get_storage_info() -> str:
     try:
         u = dbx.users_get_space_usage()
         used  = u.used
-        total = u.allocation.get_individual().allocated
+        alloc = u.allocation
+        if alloc.is_individual():
+            total = alloc.get_individual().allocated
+        elif alloc.is_team():
+            total = alloc.get_team().allocated
+        else:
+            total = 0
         pct   = (used / total * 100) if total else 0
         return (
             f"Used : {_human(used)}  ({pct:.1f} %)\n"
@@ -350,26 +356,15 @@ def get_file_versions(path: str, limit: int = 10) -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import Response as StarResponse
+    from starlette.responses import JSONResponse
 
-    class NoOAuthMiddleware(BaseHTTPMiddleware):
-        """Block OAuth discovery so Claude treats this as an auth-free server."""
-        async def dispatch(self, request, call_next):
-            if request.url.path in (
-                "/.well-known/oauth-authorization-server",
-                "/.well-known/openid-configuration",
-                "/authorize",
-                "/token",
-                "/register",
-            ):
-                return StarResponse(status_code=404)
-            return await call_next(request)
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_check(request):
+        return JSONResponse({"status": "ok", "server": "dropbox-mcp"})
 
     port = int(os.environ.get("PORT", 8000))
     print(f"🟢  Dropbox MCP server running on port {port}")
     print(f"    Connector URL → http://0.0.0.0:{port}/mcp")
 
     asgi_app = mcp.streamable_http_app()
-    asgi_app.add_middleware(NoOAuthMiddleware)
     uvicorn.run(asgi_app, host="0.0.0.0", port=port)
